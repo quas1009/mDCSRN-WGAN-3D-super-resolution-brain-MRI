@@ -1,100 +1,19 @@
 import tensorflow as tf
 import tensorflow.contrib.eager as tfe
-from tensorflow.keras.layers import Dense, Activation, Conv3D, ELU, Concatenate, BatchNormalization, Flatten, Input, Lambda
 from tensorflow.keras import Model, metrics
+from tensorflow.keras import backend as K
+from tensorflow.keras.layers import Dense, Activation, Conv3D, ELU, Concatenate
+from tensorflow.keras.layers import BatchNormalization, Flatten, Input, Lambda
+from tensorflow.keras.constraints import Constraint
+
 import numpy as np
-import nibabel as nib
-import os
-from skimage.util import view_as_windows
-import scipy.io, time 
-from sklearn.model_selection import train_test_split
-import pandas as pd
+import os, scipy, time
 from IPython import display
-from matplotlib import pyplot as plt
+
+from dataset import DatafromCSV, load_idset
+from utils import disp, merge, score_patch
+
 tfe.enable_eager_execution()
-
-# ================ Load Data from subject list =============== # 
-
-class DatafromCSV(object):
-    def __init__(self, indices):
-        self.indices = indices
-        self.length = indices.shape[0]
-        self.DIR_PATH = 'mnt/superresolution/HCP_1200/'
-        self.SUB_DIR = '/unprocessed/3T/T1w_MPR1'
-        self.CUBE = 64
-        
-    def transform(self, image):
-        image = np.array(image/4095)
-        data = tf.convert_to_tensor(image, dtype=np.float32)
-        return data
-        
-    def get_item(self,idx):
-        folder = os.path.join(self.DIR_PATH+str(idx))        
-        mat = os.path.join(self.DIR_PATH + str(idx)+ self.SUB_DIR, str(idx)+'_LR.mat')
-        nii = os.path.join(self.DIR_PATH + str(idx)+ self.SUB_DIR, str(idx)+'_3T_T1w_MPR1.nii.gz')
-        
-        lr = scipy.io.loadmat(mat)['out_final']
-        hr = nib.load(nii).get_fdata()
-        lr_sampler = self.transform(lr)
-        hr_sampler = self.transform(hr)
-        return (lr_sampler, hr_sampler)
-      
-    def get_data(self):
-        lr_data = np.zeros([self.length,256,320,320], dtype=np.float32)
-        hr_data = np.zeros([self.length,256,320,320], dtype=np.float32)
-
-        for i in range(self.length):
-            idx = self.indices[i][0]
-            (lr_data[i,:,:,:] , hr_data[i,:,:,:]) = self.get_item(idx)
-        return (lr_data, hr_data)
-      
-    def extract_patches(self,data_4d, stride):
-        cube = self.CUBE
-        data_5d = tf.expand_dims(data_4d,-1)
-        patches=tf.extract_volume_patches(
-            input=data_5d,
-            ksizes=[1, cube, cube, cube, 1],
-            strides=[1, stride, stride, stride, 1],
-            padding='VALID',
-        )
-        result_tf = tf.reshape(patches, [-1, cube, cube, cube])
-        img = result_tf
-        result = tf.expand_dims(img,-1)
-        return result
-      
-    def load_patchset(self,is_train = True):
-        lr_raw_data, hr_raw_data = self.get_data()
-        if is_train:
-            lr_dataset = tf.data.Dataset.from_tensor_slices(self.extract_patches(lr_raw_data,64))
-            hr_dataset = tf.data.Dataset.from_tensor_slices(self.extract_patches(hr_raw_data,64))
-            dataset = tf.data.Dataset.zip((lr_dataset, hr_dataset))
-        else:
-            paddings = tf.constant([[0, 0],[40, 0], [34, 0], [34,0]])
-            lr_data = tf.pad(lr_raw_data, paddings, "CONSTANT")
-            hr_data = tf.pad(hr_raw_data, paddings, "CONSTANT")
-            lr_dataset = tf.data.Dataset.from_tensor_slices(self.extract_patches(lr_raw_data,58))
-            hr_dataset = tf.data.Dataset.from_tensor_slices(self.extract_patches(hr_raw_data,58))
-            dataset = tf.data.Dataset.zip((lr_dataset, hr_dataset))
-        return dataset
-
-# ====================== Load and split dataset ====================== # 
-
-def load_idset(csv_name):
-    
-    csv_path = os.path.join(csv_name)
-    filelist = pd.read_csv(csv_path)
-    
-    train_idset,test_idset = train_test_split(filelist, test_size=0.2)
-    train_idset,val_idset_ = train_test_split(train_idset, test_size=0.125)
-    test_idset,eval_idset_ = train_test_split(test_idset, test_size=0.5)
-    print(len(train_idset),len(test_idset),len(val_idset_),len(eval_idset_))
-
-    train_set = tf.data.Dataset.from_tensor_slices(np.array(train_idset))
-    test_set = tf.data.Dataset.from_tensor_slices(np.array(test_idset))
-    val_set = tf.data.Dataset.from_tensor_slices(np.array(val_idset_))
-    eval_set = tf.data.Dataset.from_tensor_slices(np.array(eval_idset_))
-    
-    return train_set, test_set, val_set, eval_set
 
 # ============== Define the BatchNormalization Layer in Keras Model ============= # 
 
@@ -341,57 +260,6 @@ sample_id = val_set.take(1)
 sample_indices=np.array([idx.numpy() for a, idx in enumerate(sample_id)])
 Sampleloader = DatafromCSV(sample_indices)
 sample_set = Sampleloader.load_patchset()
-
-# =========================== Toolbox ============================ #
-
-def disp(sample_set,cube,step_counter):
-    sample_set=sample_set.batch(2)
-    PRED = np.array([], dtype=np.float32).reshape([0,cube,cube,cube,1])
-    HR = np.array([], dtype=np.float32).reshape([0,cube,cube,cube,1])
-    for idx, (lr, hr) in enumerate(sample_set):
-        pred = np.array(generator.predict(lr.numpy()))
-        pred = np.array(pred,dtype = np.float32)
-        PRED = np.concatenate((PRED,pred))
-        hr = np.array(hr,dtype = np.float32)
-        HR = np.concatenate((HR,hr))
-    inp = merge(PRED, cube, 1)
-    tar = merge(HR, cube, 1)
-    
-    plt.figure(figsize=(5,5))
-    plt.subplot(1,2,1)
-    plt.imshow(np.squeeze(inp[0,63,:,:,:]))
-    plt.subplot(1,2,2)
-    plt.imshow(np.squeeze(tar[0,63,:,:,:]))
-    plt.title('predict, truth')
-    plt.axis('off')
-    filename = './figure/'+str(step_counter)+'.png'
-    Handle = plt.gcf()
-    Handle.savefig(filename) 
-    plt.show()
-    
-    return inp, tar
-
-def merge(concated_tensor,cube,x):
-    d1 = int(256/cube)
-    d2 = int(320/cube)
-    d3 = int(cube*cube*cube)
-    e = np.reshape(concated_tensor,[x,d1,d2,d2,d3])
-    f1 = np.split(e,x,axis=0)
-    f2=[]
-    for item in f1:
-        f2.extend(np.split(item,d1,axis=1))
-    f3 = []
-    for item in f2:
-        f3.extend(np.split(item,d2,axis=2))
-    f = []
-    for item in f3:
-        f.extend(np.split(item,d2,axis=3))
-    g = [np.reshape(item,[1,cube,cube,cube,1]) for item in f]
-    h1 = [ np.concatenate(g[d2*i: d2*(i+1)], axis = 3) for i in range(d1*d2*x) ]
-    h2 = [ np.concatenate(h1[d2*i: d2*(i+1)], axis = 2) for i in range(d1*x) ]
-    h3 = [ np.concatenate(h2[d1*i: d1*(i+1)], axis = 1) for i in range(x) ]
-    h = np.concatenate(h3, axis = 0)
-    return h
 
 # ========================== Initial Train =========================== # 
 # ----- The Loss is need further validation: from valid images --------# 
